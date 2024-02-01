@@ -1,0 +1,807 @@
+From 051853e0f66915b08035479bdf55822e5482c199 Mon Sep 17 00:00:00 2001
+From: Kris Bahnsen <kris@embeddedarm.com>
+Date: Thu, 7 Oct 2021 17:09:26 -0700
+Subject: [PATCH 1/3] zpu: rework file layout and naming
+
+Moving forward, all applications will be prefixed with zpu_ while
+any included compilation units will not have that. Primarily for
+ease of organization and differentiation of file purpose.
+
+Introduces muxbus.c/h. Include files intended to handle MUXBUS
+interaction directly from the ZPU.
+
+Introduces ts8820.h. Constants used on the TS-8820 specifically
+for use with MUXBUS.
+
+Modifies ts_zpu.h to provide some additional macros to ease
+application interaction.
+
+With the introduction/modification of the above, applications that
+previously directly had this code in the sources have all of that
+removed and are now set up to compile and include the above as
+needed.
+---
+ src/zpu/Makefile                     |   4 +-
+ src/zpu/{zpu_fifo.c => fifo.c}       |   0
+ src/zpu/{zpu_fifo.h => fifo.h}       |   6 +-
+ src/zpu/muxbus.c                     | 222 +++++++++++++++++++++++++++
+ src/zpu/muxbus.h                     |  67 ++++++++
+ src/zpu/{zpu_strings.c => strings.c} |   2 +-
+ src/zpu/{zpu_strings.h => strings.h} |   6 +-
+ src/zpu/ts8820.h                     |  80 ++++++++++
+ src/zpu/ts_zpu.h                     |  28 ++--
+ src/zpu/zpu_demo.c                   |   4 +-
+ src/zpu/zpu_muxbus.c                 | 219 +-------------------------
+ 11 files changed, 401 insertions(+), 237 deletions(-)
+ rename src/zpu/{zpu_fifo.c => fifo.c} (100%)
+ rename src/zpu/{zpu_fifo.h => fifo.h} (94%)
+ create mode 100644 src/zpu/muxbus.c
+ create mode 100644 src/zpu/muxbus.h
+ rename src/zpu/{zpu_strings.c => strings.c} (99%)
+ rename src/zpu/{zpu_strings.h => strings.h} (63%)
+ create mode 100644 src/zpu/ts8820.h
+
+diff --git a/src/zpu/Makefile b/src/zpu/Makefile
+index 01dd03c..1507544 100644
+--- a/src/zpu/Makefile
++++ b/src/zpu/Makefile
+@@ -9,11 +9,11 @@ all: zpu_muxbus.bin zpu_demo.bin
+ %.o: %.c
+ 	$(CC) $(CFLAGS) -c $<
+ 
+-zpu_muxbus.bin: zpu_fifo.o zpu_muxbus.o
++zpu_demo.bin: fifo.o strings.o zpu_demo.o
+ 	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@
+ 	$(OBJCOPY) -S -O binary $@
+ 
+-zpu_demo.bin: zpu_fifo.o zpu_strings.o zpu_demo.o
++%.bin: fifo.o muxbus.o %.o
+ 	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@
+ 	$(OBJCOPY) -S -O binary $@
+ 
+diff --git a/src/zpu/zpu_fifo.c b/src/zpu/fifo.c
+similarity index 100%
+rename from src/zpu/zpu_fifo.c
+rename to src/zpu/fifo.c
+diff --git a/src/zpu/zpu_fifo.h b/src/zpu/fifo.h
+similarity index 94%
+rename from src/zpu/zpu_fifo.h
+rename to src/zpu/fifo.h
+index 0bcfbce..c5d6de3 100644
+--- a/src/zpu/zpu_fifo.h
++++ b/src/zpu/fifo.h
+@@ -1,7 +1,7 @@
+ /* SPDX-License-Identifier: BSD-2-Clause */
+ 
+-#ifndef __ZPU_FIFO_H__
+-#define __ZPU_FIFO_H__
++#ifndef __FIFO_H__
++#define __FIFO_H__
+ 
+ /*
+  * Place a byte in the ZPU TX FIFO and raise an IRQ after. If flow control is
+@@ -44,4 +44,4 @@ void fifo_init(void);
+  */
+ void fifo_raise_irq0(void);
+ 
+-#endif // __ZPU_FIFO_H__
++#endif // __FIFO_H__
+diff --git a/src/zpu/muxbus.c b/src/zpu/muxbus.c
+new file mode 100644
+index 0000000..35f52be
+--- /dev/null
++++ b/src/zpu/muxbus.c
+@@ -0,0 +1,222 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++
++#include <stdarg.h>
++#include <string.h>
++
++#include "ts_zpu.h"
++#include "fifo.h"
++
++#include "muxbus.h"
++
++/* NOTE: In this current implementation, only 16-but MUXBUS access are supported.
++ * This is meant specifically for the TS-8820 which has 16-bit registers only.
++ */
++
++#define READ		1
++#define WRITE		0
++
++
++
++/* MUXBUS packet construction
++ *
++ * NOTE: in this current implementation, only 16-bit MUXBUS accesses are
++ * supported.
++ *
++ * The request packet is 3 or 5 bytes. The first byte being a configuration
++ * packet, followed by the 16-bit MUXBUS address, and in the case of a write,
++ * 16-bit data to write to the address.
++ *
++ * 3 or 5 bytes
++ * MSB - 0
++ *   bit 0: 1 = MB Read, 0 = MB Write
++ *   bit 1: 1 = 16bit, 0 = 8bit
++ *   bit 7-2: Number of reads to stream + 1
++ *     A value from 0 to 63. Will cause <value>+1 muxbus transactions
++ *     which will end up with <value>+1 * 2 bytes written to the TX buffer.
++ *   This value only has meaning for reads, it is unused for MUXBUS writes.
++ * MSB - 1:2
++ *   MUXBUS address
++ * MSB - 3:4
++ *   MUXBUS data (only during MB Write)
++ *
++ * Response 2 bytes
++ *   2:1 Read data
++ *
++ * After a successful MUXBUS read or write, the ZPU will assert an IRQ to the CPU.
++ * In the case of a read, the 2 bytes are put in the FIFO before an IRQ is raised.
++ * In the case of a write, no data is put in the ZPU TX FIFO, but an IRQ is still
++ * asserted. This allows the CPU to wait until it can be assured the MUXBUS write
++ * was completed. This is safe since the CPU side FIFO read would clear the IRQ,
++ * and simply find that there was no new data in the buffer.
++ */
++
++void initmuxbusio(void)
++{
++	/* Enable 12.5 MHz clock on DIO_03 pin via FPGA reg 'd87 */
++	O_REG2 |= (1 << 23);
++
++	/* Set all AD pins to input for now */
++	OE_REG1 &= ~(0xF8000000);
++	OE_REG2 &= ~(0x000007FF);
++
++	/* ALE#, CS#, DIR, and BHE# are always outputs
++	 * Start them all off as high, aka deasserted. */
++	O_REG1 |= (ALEn_mask | CSn_mask | DIR_mask | BHEn_mask);
++	OE_REG1 |= (ALEn_mask | CSn_mask | DIR_mask | BHEn_mask);
++
++	set_dir(WRITE);
++}
++
++void set_alen(unsigned long val)
++{
++	if (val) {
++		O_REG1 |= (ALEn_mask);
++	} else {
++		O_REG1 &= ~(ALEn_mask);
++	}
++}
++
++void set_dir(unsigned long val)
++{
++	if (val) {
++		O_REG1 |= (DIR_mask);
++	} else {
++		O_REG1 &= ~(DIR_mask);
++	}
++}
++
++void set_csn(unsigned long val)
++{
++	if (val) {
++		O_REG1 |= (CSn_mask);
++	} else {
++		O_REG1 &= ~(CSn_mask);
++	}
++}
++
++/* The TS-8820 actually ignores BHE# and only accepts 16bit accesses. This line
++ * is unused in this application, but here for completeness
++ */
++void set_bhen(unsigned long val)
++{
++	if (val) {
++		O_REG1 |= (BHEn_mask);
++	} else {
++		O_REG1 &= ~(BHEn_mask);
++	}
++}
++
++unsigned long get_wait(void)
++{
++	return !!(O_REG1 & WAIT_mask);
++}
++
++void set_ad(unsigned short dat)
++{
++	O_REG1 &= ~(0xF8000000);
++	O_REG1 |= ((unsigned long)(dat << 27 ) & 0xF8000000);
++
++	O_REG2 &= ~(0x000007FF);
++	O_REG2 |= ((unsigned long)(dat >> 5) & 0x000007FF);
++}
++
++void set_ad_oe(unsigned long dir)
++{
++	if (dir) {
++		OE_REG1 |= (0xF8000000);
++		OE_REG2 |= (0x000007FF);
++	} else {
++		OE_REG1 &= ~(0xF8000000);
++		OE_REG2 &= ~(0x000007FF);
++	}
++}
++
++unsigned short get_ad(void)
++{
++	unsigned short dat = 0;
++
++	dat = ((I_REG2 & 0x000007FF) << 5);
++	dat |= ((I_REG1 & 0xF8000000) >> 27);
++
++	return dat;
++}
++
++/* This works so long as the maximum delay count is not more than half the span
++ * of the free running counter. The counter in this is 32 bits wide, so limit
++ * the max delay to 16 bits. In practice, this MUXBUS application will come
++ * nowhere near that max.
++ *
++ * Each call to this function, takes roughly 30 us round trip with a cnt of 0.
++ * Therefore, its better to busywait when needing delays shorter than 30 us.
++ */
++void delay_clks(unsigned short cnt)
++{
++	unsigned long end_time;
++
++
++	end_time = TIMER_REG + cnt;
++	while ((signed long)(end_time - TIMER_REG) > 0);
++}
++
++/* The following functions are unused in the generic MUXBUS application since it
++ * interleaves reading bytes from the ZPU FIFO and doing MUXBUS accesses. Doing
++ * so allows for a slightly smaller memory footprint
++ *
++ * These functions are most useful for the ZPU itself doing MUXBUS accesses.
++ */
++void muxbus_write_16(unsigned short adr, unsigned short dat)
++{
++	volatile cnt;
++
++	set_dir(WRITE);
++	set_ad(adr);
++	set_ad_oe(1);
++	set_alen(0);
++	/* TP_ALE is 7 clocks, ZPU code will take longer than this between
++	 * set_alen() calls, a delay is not needed here */
++	set_alen(1);
++	/* TH_ADR is 7 clocks, ZPU code will take longer than this between
++	 * set_alen() and set_ad(), a delay is not needed here */
++	set_ad(dat);
++	/* TSU_DAT is 7 clocks, ZPU code will take longer than this between
++	 * set_ad() and set_csn(), a delay is not needed here */
++	set_csn(0);
++	/* TP_CS is 67 clocks, which is roughly 1 us, short busyloop to
++	 * accommodate this delay rather than calling the longer func */
++	cnt = 1;
++	while (cnt--);
++	set_csn(1);
++	/* TH_DAT is 15 clocks, we will never get back to this function, even
++	 * when called back to back, shorter than this, delay not needed */
++}
++
++unsigned short muxbus_read_16(unsigned short adr)
++{
++	unsigned short dat;
++	volatile cnt;
++
++	set_dir(READ);
++	set_ad(adr);
++	set_ad_oe(1);
++	set_alen(0);
++	/* TP_ALE is 7 clocks, ZPU code will take longer than this between
++	 * set_alen() calls, a delay is not needed here */
++	set_alen(1);
++	/* TH_ADR is 7 clocks, ZPU code will take longer than this between
++	 * set_alen() and set_ad(), a delay is not needed here */
++	set_ad_oe(0);
++	/* TSU_DAT is 7 clocks, ZPU code will take longer than this between
++	 * set_ad() and set_csn(), a delay is not needed here */
++	set_csn(0);
++	/* TP_CS is 67 clocks, which is roughly 1 us, short busyloop to
++	 * accommodate this delay rather than calling the longer func */
++	cnt = 1;
++	while (cnt--);
++	dat = get_ad();
++	set_csn(1);
++	/* TH_DAT is 15 clocks, we will never get back to this function, even
++	 * when called back to back, shorter than this, delay not needed */
++
++	return dat;
++}
++
+diff --git a/src/zpu/muxbus.h b/src/zpu/muxbus.h
+new file mode 100644
+index 0000000..dab3a2c
+--- /dev/null
++++ b/src/zpu/muxbus.h
+@@ -0,0 +1,67 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++
++#ifndef __MUXBUS_H__
++#define __MUXBUS_H__
++
++/* NOTE: In this current implementation, only 16-but MUXBUS access are supported.
++ * This is meant specifically for the TS-8820 which has 16-bit registers only.
++ */
++
++#define READ		1
++#define WRITE		0
++
++/* AD bits are 31:27 of REG1, and 10:0 of REG2 */
++#define ALEn_bit	26
++#define DIR_bit		25
++#define CSn_bit		24
++#define BHEn_bit	23
++#define WAIT_bit	22
++
++/* AD bits are 31:27 of REG1, and 10:0 of REG2 */
++#define ALEn_mask	0x04000000 // (1 << 26)
++#define DIR_mask	0x02000000 // (1 << 25)
++#define CSn_mask	0x01000000 // (1 << 24)
++#define BHEn_mask	0x00800000 // (1 << 23)
++#define WAIT_mask	0x00400000 // (1 << 22)
++
++/* MUXBUS timing definitions have been in number of clocks of the BB WB clk
++ * In the case of the TS-8820, these are 100 MHz. MUXBUS guidelines can be
++ * found here: https://wiki.embeddedTS.com/wiki/Generic_MUXBUS
++ *
++ * The ZPU in the TS-4100 operates at 63 MHz, and has a free running counter
++ * that delay times are based on. This means that every 1.58 63 MHz clocks is
++ * 1 100 MHz clock. Round up to 2 to be safe. Additionally, all of the delay
++ * clks are + 1 in the final application
++ *
++ * The numbers below are based on a 0xF0FF value in the standard MUXBUS config
++ * register.
++ */
++#if 1
++#define TP_ALE		(0x06 + 1)
++#define TH_ADR		(0x06 + 1)
++#define TSU_DAT		(0x06 + 1)
++#define TP_CS		(0x42 + 1)
++#define TH_DAT		(0x0E + 1)
++
++#else
++#define TP_ALE		100
++#define TH_ADR		100
++#define TSU_DAT		100
++#define TP_CS		100
++#define TH_DAT		100
++#endif
++
++void initmuxbusio(void);
++void set_alen(unsigned long val);
++void set_dir(unsigned long val);
++void set_csn(unsigned long val);
++void set_bhen(unsigned long val);
++unsigned long get_wait(void);
++void set_ad(unsigned short dat);
++void set_ad_oe(unsigned long dir);
++unsigned short get_ad(void);
++void delay_clks(unsigned short cnt);
++void muxbus_write_16(unsigned short adr, unsigned short dat);
++unsigned short muxbus_read_16(unsigned short adr);
++
++#endif // __MUXBUS_H__
+diff --git a/src/zpu/zpu_strings.c b/src/zpu/strings.c
+similarity index 99%
+rename from src/zpu/zpu_strings.c
+rename to src/zpu/strings.c
+index 725d0c8..4480257 100644
+--- a/src/zpu/zpu_strings.c
++++ b/src/zpu/strings.c
+@@ -5,7 +5,7 @@
+ 
+ /* putc() is provided by zpu_fifo.c, the final printf call here needs to call
+  * putc() to write to the actual ZPU FIFO */
+-#include "zpu_fifo.h"
++#include "fifo.h"
+ 
+ /* This function is used from printf() to format int's to printable ASCII
+  * Not intended to be called directly
+diff --git a/src/zpu/zpu_strings.h b/src/zpu/strings.h
+similarity index 63%
+rename from src/zpu/zpu_strings.h
+rename to src/zpu/strings.h
+index 8b25b8f..aa4cf3e 100644
+--- a/src/zpu/zpu_strings.h
++++ b/src/zpu/strings.h
+@@ -1,10 +1,10 @@
+ /* SPDX-License-Identifier: BSD-2-Clause */
+ 
+-#ifndef __ZPU_STRINGS_H__
+-#define __ZPU_STRINGS_H__
++#ifndef __STRINGS_H__
++#define __STRINGS_H__
+ 
+ int printf(const char *format, ...);
+ int sprintf(char *pInto, const char *format, ...);
+ 
+-#endif //__ZPU_STRINGS_H__
++#endif //__STRINGS_H__
+ 
+diff --git a/src/zpu/ts8820.h b/src/zpu/ts8820.h
+new file mode 100644
+index 0000000..deeeed6
+--- /dev/null
++++ b/src/zpu/ts8820.h
+@@ -0,0 +1,80 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++
++#ifndef __TS_8820_H__
++#define __TS_8820_H__
++
++/* Register and bitmask mappings of TS-8820 FPGA */
++#define REG_ID			0x00
++
++#define REG_PU_HB		0x02
++#define PU_58_EN		0x0400
++#define PU_34_EN		0x0200
++#define PU_12_EN		0x0100
++#define HB_2_EN			0x0080
++#define HB_1_EN			0x0040
++#define HB_2_DIR		0x0020
++#define HB_1_DIR		0x0010
++#define REV_mask		0x000F
++#define REV_offs		0
++
++#define REG_DIN			0x04
++#define DIN_mask		0x3FFF
++
++#define REG_SRAM		0x06
++
++#define REG_DOUT		0x08
++#define DOUT_mask		0x003F
++#define DOUT_offs		0
++#define DOUT_PWM_EN_offs	6
++#define DOUT_PWM_EN_mask	0x0FC0
++
++#define REG_PWM1		0x10
++#define REG_PWM2		0x12
++#define REG_PWM3		0x14
++#define REG_PWM4		0x16
++#define REG_PWM5		0x18
++#define REG_PWM6		0x1A
++#define REG_PWM7		0x1C
++#define REG_PWM8		0x1E
++#define PWM_DUTY_mask		0x01FF
++#define PWM_DUTY_offs		0
++#define PWM_PRE_mask		0xE000
++#define PWM_PRE_offs		13
++
++#define REG_PULSE1		0x20
++#define REG_PULSE2		0x22
++#define REG_PULSE3		0x24
++#define REG_PULSE4		0x26
++#define REG_PULSE5		0x28
++#define REG_PULSE6		0x2A
++#define REG_PULSE7		0x2C
++#define REG_PULSE8		0x2E
++#define REG_PULSE9		0x30
++#define REG_PULSE10		0x32
++#define REG_PULSE11		0x34
++#define REG_PULSE12		0x36
++#define REG_PULSE13		0x38
++#define REG_PULSE14		0x3A
++
++#define REG_ADC_ID		0x80
++#define REG_ADC			0x82
++#define ADC_CHAN_offs		8
++#define ADC_CHAN_mask		0xFF00
++#define ADC_CHIP_offs		6
++#define ADC_CHIP_mask		0x00C0
++#define ADC_FORCE_STBY		0x0020
++#define ADC_STBY		0x0010
++#define ADC_DMA_IRQ		0x0008
++#define ADC_IRQ_EN		0x0004
++#define ADC_RUN			0x0002
++#define ADC_RESET		0x0001
++#define REG_ADC_FIFO		0x84
++#define REG_ADC_RD		0x86
++#define REG_ADC_PERIOD_LSB	0x88
++#define REG_ADC_PERIOD_MSB	0x8A
++
++#define REG_DAC1		0xA0
++#define REG_DAC2		0xA2
++#define REG_DAC3		0xA4
++#define REG_DAC4		0xA6
++#endif // __TS_8820_H__
+diff --git a/src/zpu/ts_zpu.h b/src/zpu/ts_zpu.h
+index 60e4763..0f5cc34 100644
+--- a/src/zpu/ts_zpu.h
++++ b/src/zpu/ts_zpu.h
+@@ -39,14 +39,24 @@
+  * I_REG* is read only, and reads the input value of each GPIO pin.
+  * OE_REG* is read/write, setting a bit to a 1 sets that pin as an output.
+  */
+-#define I_REG0		*(volatile unsigned long *)0x2000
+-#define I_REG1		*(volatile unsigned long *)0x2004
+-#define I_REG2		*(volatile unsigned long *)0x2008
+-#define OE_REG0		*(volatile unsigned long *)0x2010
+-#define OE_REG1		*(volatile unsigned long *)0x2014
+-#define OE_REG2		*(volatile unsigned long *)0x2018
+-#define O_REG0		*(volatile unsigned long *)0x2020
+-#define O_REG1		*(volatile unsigned long *)0x2024
+-#define O_REG2		*(volatile unsigned long *)0x2028
++#define I_REG0_ADR	(volatile unsigned long *)0x2000
++#define I_REG1_ADR	(volatile unsigned long *)0x2004
++#define I_REG2_ADR	(volatile unsigned long *)0x2008
++#define OE_REG0_ADR	(volatile unsigned long *)0x2010
++#define OE_REG1_ADR	(volatile unsigned long *)0x2014
++#define OE_REG2_ADR	(volatile unsigned long *)0x2018
++#define O_REG0_ADR	(volatile unsigned long *)0x2020
++#define O_REG1_ADR	(volatile unsigned long *)0x2024
++#define O_REG2_ADR	(volatile unsigned long *)0x2028
++
++#define I_REG0		*I_REG0_ADR
++#define I_REG1		*I_REG1_ADR
++#define I_REG2		*I_REG2_ADR
++#define OE_REG0		*OE_REG0_ADR
++#define OE_REG1		*OE_REG1_ADR
++#define OE_REG2		*OE_REG2_ADR
++#define O_REG0		*O_REG0_ADR
++#define O_REG1		*O_REG1_ADR
++#define O_REG2		*O_REG2_ADR
+ 
+ #endif // __TS_ZPU_H__
+diff --git a/src/zpu/zpu_demo.c b/src/zpu/zpu_demo.c
+index 7295294..d3e4252 100644
+--- a/src/zpu/zpu_demo.c
++++ b/src/zpu/zpu_demo.c
+@@ -4,8 +4,8 @@
+ #include <string.h>
+ 
+ #include "ts_zpu.h"
+-#include "zpu_fifo.h"
+-#include "zpu_strings.h"
++#include "fifo.h"
++#include "strings.h"
+ 
+ 
+ /* ZPU Demo application.
+diff --git a/src/zpu/zpu_muxbus.c b/src/zpu/zpu_muxbus.c
+index 19bb045..ee0e6a9 100644
+--- a/src/zpu/zpu_muxbus.c
++++ b/src/zpu/zpu_muxbus.c
+@@ -3,41 +3,10 @@
+ #include <stdarg.h>
+ #include <string.h>
+ 
+-#include "zpu_fifo.h"
++#include "muxbus.h"
++#include "fifo.h"
+ #include "ts_zpu.h"
+ 
+-/* NOTE: In this current implementation, only 16-but MUXBUS access are supported.
+- * This is meant specifically for the TS-8820 which has 16-bit registers only.
+- */
+-
+-#define READ		1
+-#define WRITE		0
+-
+-/* AD bits are 31:27 of REG1, and 10:0 of REG2 */
+-#define ALEn_bit	26
+-#define DIR_bit		25
+-#define CSn_bit		24
+-#define BHEn_bit	23
+-#define WAIT_bit	22
+-
+-/* MUXBUS timing definitions have been in number of clocks of the main BB clk.
+- * In the case of the TS-8820, these are 12.5 MHz. MUXBUS guidelines can be
+- * found here: https://wiki.embeddedTS.com/wiki/Generic_MUXBUS
+- *
+- * The ZPU in the TS-4100 operates at 63 MHz, and has a free running counter
+- * that delay times are based on. This means that every 5.04 63 MHz clocks is
+- * 1 12.5 MHz clock. Round up to 6 to be safe. Additionally, all of the delay
+- * clks are + 1 in the final application
+- *
+- * The numbers below are based on a 0xF0FF value in the standard MUXBUS config
+- * register.
+- */
+-#define TP_ALE		(0x07 + 1)	* 6
+-#define TH_ADR		(0x21 + 1)	* 6
+-#define TSU_DAT		(0x03 + 1)	* 6
+-#define TP_CS		(0x03 + 1)	* 6
+-#define TH_DAT		(0x03 + 1)	* 6
+-
+ /* State machine defines for operation loop */
+ #define	GET_CMD		0
+ #define	GET_ADRH	1
+@@ -47,190 +16,6 @@
+ #define	RET_WRITE	5
+ #define	RET_READ	6
+ 
+-/* MUXBUS packet construction
+- *
+- * NOTE: in this current implementation, only 16-bit MUXBUS accesses are
+- * supported.
+- *
+- * The request packet is 3 or 5 bytes. The first byte being a configuration
+- * packet, followed by the 16-bit MUXBUS address, and in the case of a write,
+- * 16-bit data to write to the address.
+- *
+- * 3 or 5 bytes
+- * MSB - 0
+- *   bit 0: 1 = MB Read, 0 = MB Write
+- *   bit 1: 1 = 16bit, 0 = 8bit
+- *   bit 7-2: Number of reads to stream + 1
+- *     A value from 0 to 63. Will cause <value>+1 muxbus transactions
+- *     which will end up with <value>+1 * 2 bytes written to the TX buffer.
+- *   This value only has meaning for reads, it is unused for MUXBUS writes.
+- * MSB - 1:2
+- *   MUXBUS address
+- * MSB - 3:4
+- *   MUXBUS data (only during MB Write)
+- *
+- * Response 2 bytes
+- *   2:1 Read data
+- *
+- * After a successful MUXBUS read or write, the ZPU will assert an IRQ to the CPU.
+- * In the case of a read, the 2 bytes are put in the FIFO before an IRQ is raised.
+- * In the case of a write, no data is put in the ZPU TX FIFO, but an IRQ is still
+- * asserted. This allows the CPU to wait until it can be assured the MUXBUS write
+- * was completed. This is safe since the CPU side FIFO read would clear the IRQ,
+- * and simply find that there was no new data in the buffer.
+- */
+-
+-void initmuxbusio(void)
+-{
+-	/* Enable 12.5 MHz clock on DIO_03 pin via FPGA reg 'd87 */
+-	O_REG2 |= (1 << 23);
+-
+-	/* Set all AD pins to input for now */
+-	OE_REG1 &= ~(0xF8000000);
+-	OE_REG2 &= ~(0x000007FF);
+-
+-	/* ALE#, CS#, DIR, and BHE# are always outputs
+-	 * Start them all off as high, aka deasserted. */
+-	O_REG1 |= ((1 << ALEn_bit) | (1 << CSn_bit) | (1 << DIR_bit) |
+-	  (1 << BHEn_bit));
+-	OE_REG1 |= ((1 << ALEn_bit) | (1 << CSn_bit) | (1 << DIR_bit) |
+-	  (1 << BHEn_bit));
+-}
+-
+-void set_alen(unsigned long val)
+-{
+-	if (val) {
+-		O_REG1 |= (1 << ALEn_bit);
+-	} else {
+-		O_REG1 &= ~(1 << ALEn_bit);
+-	}
+-}
+-
+-void set_dir(unsigned long val)
+-{
+-	if (val) {
+-		O_REG1 |= (1 << DIR_bit);
+-	} else {
+-		O_REG1 &= ~(1 << DIR_bit);
+-	}
+-}
+-
+-void set_csn(unsigned long val)
+-{
+-	if (val) {
+-		O_REG1 |= (1 << CSn_bit);
+-	} else {
+-		O_REG1 &= ~(1 << CSn_bit);
+-	}
+-}
+-
+-/* The TS-8820 actually ignores BHE# and only accepts 16bit accesses. This line
+- * is unused in this application, but here for completeness
+- */
+-void set_bhen(unsigned long val)
+-{
+-	if (val) {
+-		O_REG1 |= (1 << BHEn_bit);
+-	} else {
+-		O_REG1 &= ~(1 << BHEn_bit);
+-	}
+-}
+-
+-unsigned long get_wait(void)
+-{
+-	return ((O_REG1 & (1 << WAIT_bit)) >> 21);
+-}
+-
+-void set_ad(unsigned short dat)
+-{
+-	O_REG1 &= ~(0xF8000000);
+-	O_REG1 |= ((unsigned long)(dat << 27 ) & 0xF8000000);
+-
+-	O_REG2 &= ~(0x000007FF);
+-	O_REG2 |= ((unsigned long)(dat >> 5) & 0x000007FF);
+-}
+-
+-void set_ad_oe(unsigned long dir)
+-{
+-	if (dir) {
+-		OE_REG1 |= (0xF8000000);
+-		OE_REG2 |= (0x000007FF);
+-	} else {
+-		OE_REG1 &= ~(0xF8000000);
+-		OE_REG2 &= ~(0x000007FF);
+-	}
+-}
+-
+-unsigned short get_ad(void)
+-{
+-	unsigned short dat = 0;
+-
+-	dat = ((I_REG2 & 0x000007FF) << 5);
+-	dat |= ((I_REG1 & 0xF8000000) >> 27);
+-
+-	return dat;
+-}
+-
+-/* This works so long as the maximum delay count is not more than half the span
+- * of the free running counter. The counter in this is 32 bits wide, so limit
+- * the max delay to 16 bits. In practice, this MUXBUS application will come
+- * nowhere near that max.
+- */
+-void delay_clks(unsigned short cnt)
+-{
+-	unsigned long end_time;
+-
+-	end_time = TIMER_REG + cnt;
+-	while ((signed long)(end_time - TIMER_REG) > 0);
+-}
+-
+-/* The following functions are unused in this application as we normally
+- * interleave reading bytes from the ZPU FIFO and doing MUXBUS accesses. Doing so
+- * allows for a slightly smaller memory footprint
+- * The functions are left in place for completeness, but are not compiled during
+- * normal use. */
+-#if 0
+-void muxbus_write_16(unsigned short adr, unsigned short dat)
+-{
+-	set_dir(WRITE);
+-	set_ad(adr);
+-	set_ad_oe(1);
+-	set_alen(0);
+-	delay_clks(TP_ALE);
+-	set_alen(1);
+-	delay_clks(TH_ADR);
+-	set_ad(dat);
+-	delay_clks(TSU_DAT);
+-	set_csn(0);
+-	delay_clks(TP_CS);
+-	set_csn(1);
+-	delay_clks(TH_DAT);
+-}
+-
+-unsigned short muxbus_read_16(unsigned short adr)
+-{
+-	unsigned short dat;
+-
+-	set_dir(READ);
+-	set_ad(adr);
+-	set_ad_oe(1);
+-	set_alen(0);
+-	delay_clks(TP_ALE);
+-	set_alen(1);
+-	delay_clks(TH_ADR);
+-	set_ad_oe(0);
+-	delay_clks(TSU_DAT);
+-	set_csn(0);
+-	delay_clks(TP_CS);
+-	dat = get_ad();
+-	set_csn(1);
+-	delay_clks(TH_DAT);
+-
+-	return dat;
+-}
+-#endif
+-
+-
+ /* ZPU MUXBUS application.
+  *
+  * As noted above, this is only intended for 16-bit access of the TS-8820 FPGA.
+-- 
+2.30.2
+

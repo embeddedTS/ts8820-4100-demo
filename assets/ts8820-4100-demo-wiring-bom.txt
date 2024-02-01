@@ -1,0 +1,67 @@
+Wiring diagram:
+Thermistor (https://www.amazon.com/DROK-Waterproof-Temperature-Thermistor-Transimitter/dp/B01MR37GOQ Generic 10k NTC thermistor with digikey 839-1411-ND jack and 889-1849-ND plug):
+P5_1
+P5_2
+
+Analog display (https://www.adafruit.com/product/3990 Modified with assets/analog-meter... changes):
+P9_6 Ground
+P7_6 Positive (with 1M resistor to P9_2/ground)
+P7_5 -> P9_5 (5 VDC connection for analog meter)
+
+Manual motor knob (https://www.sparkfun.com/products/9939 and https://www.sparkfun.com/products/10002):
+P5_3
+P5_4
+
+Motor (https://www.sparkfun.com/products/15277):
+P6_1 Positive
+P6_2 Negative
+
+Motor Auto/manual (https://www.sparkfun.com/products/11138):
+P2_5
+P2_6
+
+Motor Rev/fwd (https://www.sparkfun.com/products/14978):
+P6_7 Common (EXT IN)
+P1_1 FWD side
+P1_2 -> P6_10 (ground)
+P1_3 REV side
+P1_4 -> P6_6 (ground)
+
+E-Stop (https://www.adafruit.com/product/1442):
+P2_8
+P2_9
+P9_8 LED+ NEEDS RESISTOR INLINE
+P7_7 LED-
+P7_8 -> P6_5
+
+Relay mirror (https://www.adafruit.com/product/481):
+P2_3
+P2_4
+P9_7 LED+
+P8_2 LED-
+P8_1 -> P9_4
+
+DC input (digikey 839-1291-ND):
+P6_9 positive
+P6_12 negative
+
+ADC voltage (https://www.sparkfun.com/products/9939 and https://www.sparkfun.com/products/10002):
+P4_5 Wiper
+P4_6 Ground
+P3_9 DAC pullup
+
+DAC mirror (https://www.adafruit.com/product/705):
+P6_8 Positive
+P6_11 Negative
+P3_11 DAC output
+
+HD1: (normally the "custom" interface, used to get 5 V switched)
+HD1_7 -> HD1_26 Ground
+HD1_8 -> HD1_24 +5 V
+HD1_8 -> HD1_5 -> HD1_6 +5 VDC for LEDs
+
+
+https://www.polycase.com/wc-42 Enclosure
+https://www.polycase.com/wx-46 Mounting plate
+https://www.matrixorbital.com/elk204-7t USB LCD
+https://www.amazon.com/Nillkin-Computer-Keyboard-Adjustable-MacBook/dp/B09M9XX8ZV?th=1 Feet

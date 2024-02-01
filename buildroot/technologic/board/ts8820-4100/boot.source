@@ -1,0 +1,1 @@
+env set cmdline_append rootwait ro console=ttymxc0,115200 init=/sbin/init
